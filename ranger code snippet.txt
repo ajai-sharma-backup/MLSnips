@@ -1,0 +1,162 @@
+NTREES = c(150, 200)
+MTRYS = c(37)
+NODESIZE = c(1,5,10)
+
+k <- 5
+library(ranger)
+par_grid <- expand.grid(NTREES, MTRYS, NODESIZE)
+par_grid <- cbind(INDEX = 1:nrow(par_grid), par_grid)
+par_grid <- cbind(par_grid, ACCURACIES = rep(0, nrow(par_grid)))
+folds <- makeFolds(matched_los, k)
+for (i in par_grid$INDEX){
+  accuracies <- rep(0,k)
+  print(par_grid[i,])
+  for (j in 1:k) {
+    train <- setdiff(as.numeric(unlist(folds)), folds[[j]])
+    test <- -train
+    temp_model <- ranger( X.HIGH_PERFORMER. ~.,
+                          data = matched_los[train,-c(1,2)],
+                          num.trees = par_grid[i,2],
+                          mtry = par_grid[i,3],
+                          write.forest = TRUE,
+                          min.node.size = par_grid[i,4],
+                          #respect.unordered.factors = TRUE,
+                          verbose = TRUE,
+                          seed = 108)
+    
+    # predict results
+    preds <- predict(temp_model, matched_los[test,-c(1,2)], type = "prob")
+    
+    # Calculate Gini
+    
+    pred <- prediction(predictions = preds$predictions, 
+                       labels = matched_los$X.HIGH_PERFORMER.[test])
+    perf <- performance(pred, "auc")
+    accuracies[j] <- 
+      (2 * unlist(slot(perf, "y.values"))) - 1
+    print(paste("iteration", j, "...", "done", "the gini is", accuracies[j]))
+  }
+  par_grid[i,5] <- mean(accuracies)
+}
+par_grid
+which(par_grid$ACCURACIES == max(par_grid$ACCURACIES))
+
+#########################################################
+
+
+# Load functions
+################################################################################
+####################### Tuning Gradient Boosting ###############################
+################################################################################
+
+# A small library for finding optimal hyperparameters for the xgboost 
+# implementation of Gradient Boosting.
+
+# Todos
+#  - Figure out how to speed up.
+#    - Paralellize
+#    - Values for niter corresponding to eta.
+#        - Short circuit if error dips below max error by a certain amount.
+
+################################################################################
+#################################### FUNCTION ##################################
+################################################################################
+# INPUTS:
+#ETAS - a vector of eta-values (learning rates)
+#DEPTHS - a vector of depths (depths of the compoent trees)
+#DFRAME - model matrix of predictors
+#TARGET - vector with length = number of rows in DFRAME with the target values
+#K - number of folds of CV to perform.
+#maxIter - maximum number of trees to consider
+
+# OUTPUTS:
+# DATAFRAME with eta, depth, niter, and a k fold cross validated gini.
+tune_xgb <- function(etas, depths, dframe, target, k, maxIter) {
+  base_grid <- expand.grid(etas, depths) 
+  kfolds <- makeFolds(dframe, k)
+  base_mods <- apply(base_grid, 1, function(x) { 
+    base_xgb_models(ETA = x[1],
+                    DEPTH = x[2], 
+                    MAXITER = maxIter, 
+                    XMAT = dframe, 
+                    TARGET =  target, 
+                    FOLDS = kfolds, 
+                    VERBOSE = TRUE)})
+  
+  row_nums <- 1:nrow(base_grid)
+  base_grid <- cbind(base_grid, row_nums)
+  
+  # now for each row in base grid, evaluate models over 1:maxIter
+  comp_grids_cvs <- apply(base_grid, 1, function(x) {
+    comp_grid <- expand.grid(x[1], x[2], 1:maxIter)
+    comp_grid_results <- apply(comp_grid, 1, function(y) {
+      return(kfoldcverror(base_mods[[x[3]]], y[3], dframe, target, kfolds))
+    })
+    comp_grid <- cbind(comp_grid, comp_grid_results)
+  })
+  library(data.table)
+  all_results <- as.data.frame(data.table::rbindlist(comp_grids_cvs))
+  colnames(all_results) <- c("Learning_rate", "Depth", "NTrees", "kFoldCVGini")
+  print("The best model is: ")
+  print(all_results[which(all_results[,4] == max(all_results[,4])),])
+  return(all_results)
+}
+
+################################################################################             
+############################# FUNCTION #########################################
+################################################################################             
+# creates a base model.
+base_xgb_models <- function(ETA, DEPTH, MAXITER, XMAT, TARGET, FOLDS, VERBOSE) {
+  require(xgboost)
+  output <- list()
+  for (i in 1:length(FOLDS)){
+    train_on <- setdiff(as.numeric(unlist(FOLDS)), FOLDS[[i]])
+    output[[i]] <- xgboost(data = XMAT[train_on,],
+                           label = TARGET[train_on],
+                           params = list(objective = "binary:logistic", 
+                                         eta = ETA, 
+                                         max.depth = DEPTH),
+                           nrounds = MAXITER,
+                           verbose = ifelse(VERBOSE, 2, 0))
+  }
+  return(output)
+}
+################################################################################             
+############################# END FUNCTION #####################################
+################################################################################
+
+################################################################################             
+############################# FUNCTION #########################################
+################################################################################             
+# Takes TRAININGDF a data frame, and NUMFOLDS the number of folds
+# Returns a list of folds
+makeFolds <- function(trainingDF, numFolds) {
+  cv.indices <- sample(1:nrow(trainingDF), nrow(trainingDF), replace = FALSE)
+  cv.folds = split(cv.indices, 
+                   ceiling(seq_along(cv.indices)/(length(cv.indices)/numFolds)))
+  return(cv.folds)
+}
+################################################################################             
+############################# END FUNCTION #####################################
+################################################################################
+
+################################################################################             
+############################# FUNCTION #########################################
+################################################################################             
+# Returns kfold cv error
+kfoldcverror <- function(MODELLIST, NITER, DFRAME, TARGET, KFOLDS) {
+  ginis <- rep(0, length(KFOLDS))
+  for( i in 1:length(KFOLDS)) {
+    preds <- predict(MODELLIST[[i]], DFRAME[KFOLDS[[i]],], ntreelimit = NITER)
+    library(ROCR)
+    pred <- prediction(predictions = preds, 
+                       labels = TARGET[KFOLDS[[i]]])
+    perf <- performance(pred, "auc")
+    ginis[i] <- (2 * unlist(slot(perf, "y.values"))) - 1
+  }
+  return(mean(ginis))
+}
+################################################################################             
+############################# END FUNCTION #####################################
+################################################################################
+
